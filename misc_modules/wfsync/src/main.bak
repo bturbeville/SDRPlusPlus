@@ -1,0 +1,241 @@
+/* 
+  WFview SDR++ Sync for using SDR++ as panadapter
+  Bob Turbeville KN4B
+*/
+#include <utils/proto/rigctl.h>
+#include <imgui.h>
+#include <module.h>
+#include <gui/gui.h>
+#include <gui/style.h>
+#include <core.h>
+#include <signal_path/signal_path.h>
+#include <gui/widgets/frequency_select.h>
+#include <radio_interface.h>
+#include <config.h>
+#include <stdio.h>
+#include <string.h>
+
+#define CONCAT(a, b) ((std::string(a) + b).c_str())
+
+SDRPP_MOD_INFO{
+    /* Name:            */ "wfsync",
+    /* Description:     */ "WFView SDR++ sync controller",
+    /* Author:          */ "Bob Turbeville KN4B",
+    /* Version:         */ 0, 1, 0,
+    /* Max instances    */ 1
+};
+
+ConfigManager config;
+
+class WFSync : public ModuleManager::Instance {
+public:
+    WFSync(std::string name) {
+        this->name = name;
+
+        strcpy(host, "127.0.0.1");
+
+        config.acquire();
+        if (config.conf[name].contains("host")) {
+            std::string h = config.conf[name]["host"];
+            strcpy(host, h.c_str());
+        }
+        if (config.conf[name].contains("port")) {
+            port = config.conf[name]["port"];
+            port = std::clamp<int>(port, 1, 65535);
+        }
+        config.release();
+
+        gui::menu.registerEntry(name, menuHandler, this, NULL);
+
+    }
+
+    ~WFSync() {
+        stop();
+        gui::menu.removeEntry(name);
+    }
+
+    void postInit() {
+    }
+
+    void enable() {
+        enabled = true;
+    }
+
+    void disable() {
+        enabled = false;
+    }
+
+    bool isEnabled() {
+        return enabled;
+    }
+
+    void start() {
+        std::lock_guard<std::recursive_mutex> lck(mtx);
+        if (running) { return; }
+
+        // Connect to wfview rigctl server
+        try {
+            client = net::rigctl::connect(host, port);
+        }
+        catch (const std::exception& e) {
+            flog::error("Could not connect: {}", e.what());
+            return;
+        }
+
+        lastFreq = 0.0;
+        lastCall.tv_nsec = lastCall.tv_sec = 0;
+        running = true;
+    }
+
+    void stop() {
+        std::lock_guard<std::recursive_mutex> lck(mtx);
+        if (!running) { return; }
+
+        // Disconnect from wfview rigctl server
+        client->close();
+        running = false;
+    }
+
+private:
+
+    static void menuHandler(void* ctx) {
+        WFSync* _this = (WFSync*)ctx;
+        float menuWidth = ImGui::GetContentRegionAvail().x;
+
+        if (_this->running) { style::beginDisabled(); }
+        if (ImGui::InputText(CONCAT("##_wfsync_cli_host_", _this->name), _this->host, 1023)) {
+            config.acquire();
+            config.conf[_this->name]["host"] = std::string(_this->host);
+            config.release(true);
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(menuWidth - ImGui::GetCursorPosX());
+        if (ImGui::InputInt(CONCAT("##_wfsync_cli_port_", _this->name), &_this->port, 0, 0)) {
+            config.acquire();
+            config.conf[_this->name]["port"] = _this->port;
+            config.release(true);
+        }
+        if (_this->running) { style::endDisabled(); }
+
+        ImGui::FillWidth();
+        if (_this->running && ImGui::Button(CONCAT("Stop##_wfsync_cli_stop_", _this->name), ImVec2(menuWidth, 0))) {
+            _this->stop();
+        }
+        else if (!_this->running && ImGui::Button(CONCAT("Start##_wfsync_cli_stop_", _this->name), ImVec2(menuWidth, 0))) {
+            _this->start();
+        }
+
+        ImGui::TextUnformatted("Status:");
+        ImGui::SameLine();
+        if (_this->client && _this->client->isOpen() && _this->running) {
+            ImGui::TextColored(ImVec4(0.0, 1.0, 0.0, 1.0), "Connected");
+        }
+        else if (_this->client && _this->running) {
+            ImGui::TextColored(ImVec4(1.0, 1.0, 0.0, 1.0), "Disconnected");
+        }
+        else {
+            ImGui::TextUnformatted("Idle");
+        }
+
+        _this->do_sync();
+
+    }
+#if defined (_WIN32) || defined(_WIN64)
+/*
+    #define CLOCK_MONOTONIC_RAW  4
+    struct timespec { 
+        long tv_sec;
+        long tv_nsec; 
+    }; 
+
+    int clock_gettime(int, struct timespec *spec) {  
+    # define CLOCK_MONOTONIC_RAW  4
+        __int64 wintime; GetSystemTimeAsFileTime((FILETIME*)&wintime);
+        wintime      -=116444736000000000i64;  //1jan1601 to 1jan1970
+        spec->tv_sec  =wintime / 10000000i64;           //seconds
+        spec->tv_nsec =wintime % 10000000i64 *100;      //nano-seconds
+        return 0;
+    }
+*/
+#endif      
+
+    void do_sync() {
+        struct timespec callTime;
+        ulong elapsed;
+        int sdrmode;
+        //float sdrbw;
+        //int wfmode;
+        //float wfbw;
+        //int wfmode
+
+        if (!this->client || !this->client->isOpen() || !this->running) { return; }
+
+        clock_gettime(CLOCK_REALTIME, &callTime);
+        
+        elapsed = ((callTime.tv_sec - lastCall.tv_sec) * 1000000) + ((callTime.tv_nsec - lastCall.tv_nsec) / 1000);
+
+        if(elapsed > 200000) {
+            ImGui::WaterfallVFO* vfo = gui::waterfall.vfos[gui::waterfall.selectedVFO];
+            int snapInt = vfo->snapInterval;
+            double sdrFreq = int(gui::waterfall.getCenterFrequency() + sigpath::vfoManager.getOffset(gui::waterfall.selectedVFO));
+            double wfFreq = this->client->getFreq();
+            //core::modComManager.callInterface(gui::waterfall.selectedVFO, RADIO_IFACE_CMD_GET_MODE, NULL, &sdrmode);
+            //core::modComManager.callInterface(gui::waterfall.selectedVFO, RADIO_IFACE_CMD_GET_BANDWIDTH, NULL, &sdrbw);
+
+            if(sdrFreq == wfFreq) {
+                // Do nothing but make sure lastFreq is set
+                this->lastFreq = wfFreq;
+            }
+            else if(wfFreq != this->lastFreq) {
+                // Give priority to the radio
+                this->lastFreq = wfFreq;
+                tuner::tune(tuner::TUNER_MODE_NORMAL, gui::waterfall.selectedVFO, this->lastFreq);
+            }
+            else if(sdrFreq != this->lastFreq) {
+                this->lastFreq = sdrFreq;
+                this->client->setFreq(this->lastFreq);
+            }
+            /*
+            if(lastMode != wfmode)
+            {
+                lastMode = mode;
+                flog::debug("Mode {} BW {}",mode, bw);
+            }
+            */
+            this->lastCall = callTime;
+        }
+    }
+
+
+    struct timespec lastCall = {0,0};
+    double lastFreq;
+    int lastMode = 0;
+    int isInit = 0;
+
+    std::string name;
+    bool enabled = true;
+    bool running = false;
+    std::recursive_mutex mtx;
+
+    char host[1024];
+    int port = 4532;
+    std::shared_ptr<net::rigctl::Client> client;
+};
+MOD_EXPORT void _INIT_() {
+    config.setPath(core::args["root"].s() + "/wfsync_config.json");
+    config.load(json::object());
+    config.enableAutoSave();
+}
+
+MOD_EXPORT ModuleManager::Instance* _CREATE_INSTANCE_(std::string name) {
+    return new WFSync(name);
+}
+
+MOD_EXPORT void _DELETE_INSTANCE_(void* instance) {
+    delete (WFSync *)instance;
+}
+
+MOD_EXPORT void _END_() {
+    config.disableAutoSave();
+    config.save();
+}
