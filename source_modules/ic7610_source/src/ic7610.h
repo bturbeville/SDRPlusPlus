@@ -4,7 +4,13 @@
 #include <vector>
 #include <string>
 #include <thread>
+#if defined (__linux__) || defined (__APPLE__)
+#include <unistd.h>
+#include "ftd3xx.h"
+#define Sleep(x) usleep(x * 1000)
+#else
 #include "FTD3XX.h"
+#endif
 
 #define IQ_EP       0x84
 #define CTL_EP_OUT  0x02

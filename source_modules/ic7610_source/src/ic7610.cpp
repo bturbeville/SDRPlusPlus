@@ -63,8 +63,11 @@ namespace ic7610 {
         for(int i = 0; i < pad; i++)
             pkt.push_back(0xFF);
 
-
+#if defined (__linux__) || defined (__APPLE__)
+        FT_STATUS ftStatus = FT_WritePipeEx(m_FTHandle, 0, pkt.data(), pkt.size(), &transferred, 1000);
+#else
         FT_STATUS ftStatus = FT_WritePipe(m_FTHandle, 0x02, pkt.data(), pkt.size(), &transferred, NULL);
+#endif
         if(FT_FAILED(ftStatus))
         {
             flog::debug("Failed to send FTDI packet");
@@ -75,10 +78,14 @@ namespace ic7610 {
 
     std::vector<uint8_t> Client::getPacket()
     {
-        unsigned long transferred = 0;
+        ULONG transferred = 0;
         uint8_t tbuff[64];
 
+#if defined (__linux__) || defined (__APPLE__)
+        FT_STATUS ftStatus = FT_ReadPipeEx(m_FTHandle, 0, tbuff, sizeof(tbuff), &transferred, 1000);
+#else
         FT_STATUS ftStatus = FT_ReadPipe(m_FTHandle, 0x82, tbuff, sizeof(tbuff), &transferred, NULL);
+#endif
         if(FT_FAILED(ftStatus))
         {
             flog::debug("Failed to get response");
@@ -324,27 +331,35 @@ namespace ic7610 {
     {
         FT_STATUS ftStatus = FT_OK;
         DWORD dwNumDevices = 0;
+        FT_DEVICE_LIST_INFO_NODE nodes[16];
 
+#if defined (__linux__) || defined (__APPLE__)
+        std::chrono::steady_clock::time_point const timeout =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(1000);
+
+        do {
+            if (FT_OK == FT_CreateDeviceInfoList(&dwNumDevices))
+                break;
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        } while (std::chrono::steady_clock::now() < timeout);
+        flog::debug("Total {0} device(s)", dwNumDevices);
+#else
         ftStatus = FT_CreateDeviceInfoList(&dwNumDevices);
         if (FT_FAILED(ftStatus))
         {
             flog::debug("Failed to get devices");
             return 0;
         }
+#endif
 
-        *ptDevicesInfo = (FT_DEVICE_LIST_INFO_NODE*)malloc(sizeof(FT_DEVICE_LIST_INFO_NODE) * dwNumDevices);
-        if (!(*ptDevicesInfo))
-        {
-            flog::debug("Malloc failure");
-            return 0;
-        }
+        ftStatus = FT_GetDeviceInfoList(nodes, &dwNumDevices);
 
-        ftStatus = FT_GetDeviceInfoList(*ptDevicesInfo, &dwNumDevices);
+        free(*ptDevicesInfo);
+        *ptDevicesInfo = NULL;
         if (FT_FAILED(ftStatus))
         {
             flog::debug("Failed to get device list");
-            free(*ptDevicesInfo);
-            *ptDevicesInfo = NULL;
             return 0;
         }
 
@@ -382,11 +397,11 @@ namespace ic7610 {
         FT_STATUS ftResult = FT_OK;
 
 
-        if((dwNumDevices = getNumDevicesConnected()) == 0)
-        {
-            flog::info("No D3xx devices found");
-            return false;
-        }
+        //if((dwNumDevices = getNumDevicesConnected()) == 0)
+        //{
+        //    flog::info("No D3xx devices found");
+        //    return false;
+        //}
 
         if(getDeviceList(&ptDevicesInfo) == 0)
         {
@@ -394,26 +409,28 @@ namespace ic7610 {
             return false;
         }
 
+#if defined (__linux__) || defined (__APPLE__)
+
+    	ftStatus = FT_Create(0, FT_OPEN_BY_INDEX, &m_FTHandle);
+#else
         m_dwDeviceIndex = getDeviceIndex(ptDevicesInfo, dwNumDevices);
+        free(ptDevicesInfo);
         if(m_dwDeviceIndex == 0xFFFFFFFF)
         {
             flog::info("No D3xx in list");
-            free(ptDevicesInfo);
             return false;
         }
-
-        free(ptDevicesInfo);
-
         m_FTHandle = NULL;
 
-        ftStatus = FT_Create("IC-7610 SuperSpeed-FIFO Bridge", FT_OPEN_BY_DESCRIPTION, &m_FTHandle);
-
+        ftStatus = FT_Create((PVOID)"IC-7610 SuperSpeed-FIFO Bridge", FT_OPEN_BY_DESCRIPTION, &m_FTHandle);
+#endif
         if(FT_FAILED(ftStatus))
         {
             flog::info("Failed to open device");
             return false;
         }
 
+        /*
         uint16_t uVID = 0;
         uint16_t uPID = 0;
 
@@ -424,7 +441,7 @@ namespace ic7610 {
         }
 
         flog::debug("Found VID {0} PID {1}", uVID, uPID);
-        /*
+        
         ZeroMemory(&DeviceDescriptor, sizeof(FT_DEVICE_DESCRIPTOR));
         ZeroMemory(&ConfigurationDescriptor, sizeof(FT_CONFIGURATION_DESCRIPTOR));
         ZeroMemory(&InterfaceDescriptor, sizeof(FT_INTERFACE_DESCRIPTOR));
@@ -516,10 +533,13 @@ namespace ic7610 {
         uint8_t* pBuffer = NULL;
         ULONG ulActualBytesTransferred = 0;
         ULONG ulActualBytesToTransfer = 32768;
+        ULONG transferred = 0;
         
         pBuffer = new uint8_t[32768];
 
-        ftStatus = FT_SetStreamPipe(m_FTHandle, FALSE, FALSE, IQ_EP, ulActualBytesToTransfer);
+
+        ftStatus = FT_SetStreamPipe(m_FTHandle, FALSE, FALSE, 2, ulActualBytesToTransfer);
+        //ftStatus = FT_SetStreamPipe(m_FTHandle, FALSE, FALSE, IQ_EP, ulActualBytesToTransfer);
         if (FT_FAILED(ftStatus))
         {
             goto exit;
@@ -527,19 +547,18 @@ namespace ic7610 {
 
         flog::debug("Worker starting");
 
-        // Get band 0 frequency
-        unsigned long transferred = 0;
-
-
         while (m_running)
         {
             ulActualBytesTransferred = 0;
-
+#if defined (__linux__) || defined (__APPLE__)
+            ftStatus = FT_ReadPipeEx(m_FTHandle, 2, pBuffer, ulActualBytesToTransfer, &ulActualBytesTransferred, 1000);
+#else
             ftStatus = FT_ReadPipe(m_FTHandle, IQ_EP, pBuffer, ulActualBytesToTransfer, &ulActualBytesTransferred, NULL);
+#endif
             if (FT_FAILED(ftStatus))
             {
                 flog::info("Read pipe failed");
-                fprintf(stderr, "%ld\n", ftStatus);
+                fprintf(stderr, "%u\n", ftStatus);
                 break;
             }
             ULONG i = 0;
@@ -548,7 +567,8 @@ namespace ic7610 {
         }
     exit:
         flog::info("Worker thread exited");
-        FT_ClearStreamPipe(m_FTHandle, FALSE, FALSE, IQ_EP);
+        FT_ClearStreamPipe(m_FTHandle, FALSE, FALSE, 2);
+        //FT_ClearStreamPipe(m_FTHandle, FALSE, FALSE, IQ_EP);
 
         if (pBuffer)
         {

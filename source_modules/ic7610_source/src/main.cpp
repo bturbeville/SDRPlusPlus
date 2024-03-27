@@ -158,7 +158,7 @@ private:
 
     }
 
-    void IC7610SourceModule::worker()
+    void worker()
     {
         flog::info("rig thread running");
         while(running)
